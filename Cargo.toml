@@ -1,0 +1,12 @@
+[package]
+name = "frust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "frust"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
