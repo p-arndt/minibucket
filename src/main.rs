@@ -1,4 +1,4 @@
-// frust: a tiny, dependency-free S3-compatible object storage server.
+// minibucket: a tiny, dependency-free S3-compatible object storage server.
 
 mod creds;
 mod hmac;
@@ -12,6 +12,7 @@ mod storage;
 mod tagging;
 mod url;
 mod util;
+mod versioning;
 
 use std::env;
 use std::io::Write;
@@ -67,8 +68,8 @@ fn parse_args() -> Config {
             "--domain" => cfg.domain = args.next(),
             "--anonymous" => cfg.anonymous = true,
             "--help" | "-h" => {
-                println!("frust — minimal S3-compatible server\n");
-                println!("Usage: frust [options]");
+                println!("minibucket — minimal S3-compatible server\n");
+                println!("Usage: minibucket [options]");
                 println!("  --bind ADDR              default 127.0.0.1:9000");
                 println!("  --root DIR               default ./data");
                 println!("  --access-key K           access key id (use with --secret-key)");
@@ -114,7 +115,7 @@ fn main() {
 
     let listener = TcpListener::bind(&cfg.bind).expect("bind");
     eprintln!(
-        "frust listening on http://{} (root: {})",
+        "minibucket listening on http://{} (root: {})",
         cfg.bind,
         cfg.root.display()
     );

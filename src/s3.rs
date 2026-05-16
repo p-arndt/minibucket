@@ -70,6 +70,21 @@ pub fn dispatch(
         };
     }
 
+    // Versioning routes.
+    if has_q(&query, "versioning") && key.is_empty() {
+        return match method.as_str() {
+            "GET" => crate::versioning::get_versioning(srv, sock, &bucket, &rid),
+            "PUT" => crate::versioning::put_versioning(srv, &mut req, sock, &bucket, &rid),
+            _ => error_response(sock, 405, "MethodNotAllowed", "versioning route", &rid, &req.path),
+        };
+    }
+    if has_q(&query, "versions") && key.is_empty() && method == "GET" {
+        return crate::versioning::list_versions(srv, sock, &bucket, &query, &rid);
+    }
+
+    // Per-version GET/HEAD/DELETE.
+    let version_id = qget(&query, "versionId").map(|s| s.to_string());
+
     let result: std::io::Result<()> = match method.as_str() {
         "GET" if bucket.is_empty() => list_buckets(srv, sock, &rid),
         "GET" if key.is_empty() && has_q(&query, "location") => bucket_location(srv, sock, &bucket, &rid),
@@ -84,9 +99,9 @@ pub fn dispatch(
             copy_object(srv, sock, &bucket, &key, &req.headers, &rid)
         }
         "PUT" => put_object(srv, &mut req, sock, &bucket, &key, &rid, chunk_ctx),
-        "GET" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, false),
-        "HEAD" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, true),
-        "DELETE" => delete_object(srv, sock, &bucket, &key, &rid),
+        "GET" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, false, version_id.as_deref()),
+        "HEAD" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, true, version_id.as_deref()),
+        "DELETE" => delete_object(srv, sock, &bucket, &key, version_id.as_deref(), &rid),
         _ => error_response(sock, 501, "NotImplemented", "Method not supported", &rid, &req.path),
     };
     result
@@ -124,7 +139,7 @@ fn list_buckets(srv: &Server, sock: &mut std::net::TcpStream, rid: &str) -> std:
     let mut body = String::new();
     body.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     body.push_str(r#"<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#);
-    body.push_str("<Owner><ID>frust</ID><DisplayName>frust</DisplayName></Owner><Buckets>");
+    body.push_str("<Owner><ID>minibucket</ID><DisplayName>minibucket</DisplayName></Owner><Buckets>");
     for b in &buckets {
         body.push_str(&format!(
             "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",
@@ -357,7 +372,7 @@ fn put_object(
         }
     }
 
-    let (etag, size) = match writer.finish(&content_type) {
+    let (etag, size, vid) = match writer.finish(&content_type) {
         Ok(v) => v,
         Err(e) => return error_response(sock, 500, "InternalError", &format!("finalize: {}", e), rid, key),
     };
@@ -368,9 +383,12 @@ fn put_object(
         }
     }
 
-    let resp = Response::new(200)
+    let mut resp = Response::new(200)
         .header("ETag", &format!("\"{}\"", etag))
         .header("x-amz-request-id", rid);
+    if let Some(v) = vid {
+        resp = resp.header("x-amz-version-id", &v);
+    }
     resp.write_headers(sock, Some(0))?;
     Ok(())
 }
@@ -418,7 +436,7 @@ fn copy_object(
             return error_response(sock, 500, "InternalError", &format!("{}", e), rid, dst_key);
         }
     }
-    let (etag, _size) = match writer.finish(&meta.content_type) {
+    let (etag, _size, _vid) = match writer.finish(&meta.content_type) {
         Ok(v) => v,
         Err(e) => return error_response(sock, 500, "InternalError", &format!("{}", e), rid, dst_key),
     };
@@ -443,15 +461,32 @@ fn get_object(
     headers: &Headers,
     rid: &str,
     head_only: bool,
+    version_id: Option<&str>,
 ) -> std::io::Result<()> {
-    let (meta, mut file) = match srv.storage.get_object(bucket, key) {
-        Ok(v) => v,
-        Err(StorageError::NotFound) => {
-            return error_response(sock, 404, "NoSuchKey", "The specified key does not exist", rid, key);
+    let (meta, mut file) = match version_id {
+        Some(v) => {
+            if srv.storage.is_delete_marker(bucket, key, v) {
+                return error_response(sock, 405, "MethodNotAllowed", "version is a delete marker", rid, key);
+            }
+            match srv.storage.get_object_version(bucket, key, v) {
+                Ok(r) => r,
+                Err(StorageError::NotFound) => {
+                    return error_response(sock, 404, "NoSuchVersion", "version not found", rid, key);
+                }
+                Err(e) => {
+                    return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, key);
+                }
+            }
         }
-        Err(e) => {
-            return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, key);
-        }
+        None => match srv.storage.get_object(bucket, key) {
+            Ok(r) => r,
+            Err(StorageError::NotFound) => {
+                return error_response(sock, 404, "NoSuchKey", "The specified key does not exist", rid, key);
+            }
+            Err(e) => {
+                return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, key);
+            }
+        },
     };
     let size = file.metadata()?.len();
 
@@ -473,6 +508,9 @@ fn get_object(
         .header("Last-Modified", &crate::util::http_date(meta.last_modified))
         .header("Accept-Ranges", "bytes")
         .header("x-amz-request-id", rid);
+    if let Some(v) = &meta.version_id {
+        resp = resp.header("x-amz-version-id", v);
+    }
     if status == 206 {
         let cr = format!("bytes {}-{}/{}", start, start + length - 1, size);
         resp = resp.header("Content-Range", &cr);
@@ -504,10 +542,40 @@ fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {
     Some((s, end))
 }
 
-fn delete_object(srv: &Server, sock: &mut std::net::TcpStream, bucket: &str, key: &str, rid: &str) -> std::io::Result<()> {
+fn delete_object(
+    srv: &Server,
+    sock: &mut std::net::TcpStream,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    rid: &str,
+) -> std::io::Result<()> {
+    if let Some(v) = version_id {
+        // Permanent delete of a specific version.
+        match srv.storage.delete_object_version(bucket, key, v) {
+            Ok(was_marker) => {
+                let mut resp = Response::new(204)
+                    .header("x-amz-request-id", rid)
+                    .header("x-amz-version-id", v);
+                if was_marker {
+                    resp = resp.header("x-amz-delete-marker", "true");
+                }
+                return resp.write_headers(sock, Some(0));
+            }
+            Err(StorageError::NotFound) => {
+                return error_response(sock, 404, "NoSuchBucket", "no such bucket", rid, bucket);
+            }
+            Err(e) => return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, key),
+        }
+    }
     match srv.storage.delete_object(bucket, key) {
-        Ok(()) => {
-            let resp = Response::new(204).header("x-amz-request-id", rid);
+        Ok(vid) => {
+            let mut resp = Response::new(204).header("x-amz-request-id", rid);
+            if let Some(v) = vid {
+                resp = resp
+                    .header("x-amz-version-id", &v)
+                    .header("x-amz-delete-marker", "true");
+            }
             resp.write_headers(sock, Some(0))
         }
         Err(StorageError::NotFound) => {
@@ -524,29 +592,73 @@ fn delete_objects(
     bucket: &str,
     rid: &str,
 ) -> std::io::Result<()> {
-    // Read body (small XML) -- supports fixed or aws-chunked.
+    // Read body (small XML) -- supports fixed or aws-chunked. We pull each
+    // <Object>...</Object> entry and parse its <Key> plus optional <VersionId>.
     let body = read_body_all(req)?;
     let s = String::from_utf8_lossy(&body);
-    // Naive XML parse: pull <Key>...</Key> values.
-    let mut keys = Vec::new();
+    let mut items: Vec<(String, Option<String>)> = Vec::new();
     let mut idx = 0;
-    while let Some(start) = s[idx..].find("<Key>") {
-        let from = idx + start + 5;
-        if let Some(end) = s[from..].find("</Key>") {
-            keys.push(s[from..from + end].to_string());
-            idx = from + end + 6;
-        } else {
-            break;
+    while let Some(start) = s[idx..].find("<Object>") {
+        let from = idx + start + "<Object>".len();
+        let end = match s[from..].find("</Object>") {
+            Some(e) => from + e,
+            None => break,
+        };
+        let block = &s[from..end];
+        let key = inner_text(block, "Key").unwrap_or_default();
+        let vid = inner_text(block, "VersionId");
+        if !key.is_empty() {
+            items.push((key, vid));
+        }
+        idx = end + "</Object>".len();
+    }
+    // Fallback: bare <Key> elements (older clients).
+    if items.is_empty() {
+        let mut i = 0;
+        while let Some(p) = s[i..].find("<Key>") {
+            let from = i + p + 5;
+            if let Some(e) = s[from..].find("</Key>") {
+                items.push((s[from..from + e].to_string(), None));
+                i = from + e + 6;
+            } else { break; }
         }
     }
 
     let mut body_out = String::new();
     body_out.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     body_out.push_str(r#"<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#);
-    for k in &keys {
-        match srv.storage.delete_object(bucket, k) {
-            Ok(()) => {
-                body_out.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(k)));
+    for (k, vid) in &items {
+        let result = match vid {
+            Some(v) => srv
+                .storage
+                .delete_object_version(bucket, k, v)
+                .map(|was_marker| (None::<String>, was_marker, Some(v.clone()))),
+            None => srv
+                .storage
+                .delete_object(bucket, k)
+                .map(|marker_vid| (marker_vid.clone(), marker_vid.is_some(), None)),
+        };
+        match result {
+            Ok((new_marker_vid, was_marker, deleted_vid)) => {
+                body_out.push_str(&format!("<Deleted><Key>{}</Key>", xml_escape(k)));
+                if let Some(v) = &deleted_vid {
+                    body_out.push_str(&format!("<VersionId>{}</VersionId>", xml_escape(v)));
+                }
+                if was_marker {
+                    body_out.push_str("<DeleteMarker>true</DeleteMarker>");
+                    if let Some(v) = &new_marker_vid {
+                        body_out.push_str(&format!(
+                            "<DeleteMarkerVersionId>{}</DeleteMarkerVersionId>",
+                            xml_escape(v)
+                        ));
+                    } else if let Some(v) = &deleted_vid {
+                        body_out.push_str(&format!(
+                            "<DeleteMarkerVersionId>{}</DeleteMarkerVersionId>",
+                            xml_escape(v)
+                        ));
+                    }
+                }
+                body_out.push_str("</Deleted>");
             }
             Err(_) => {
                 body_out.push_str(&format!(
@@ -588,6 +700,14 @@ pub fn write_xml(sock: &mut std::net::TcpStream, status: u16, body: &str, rid: &
     resp.write_headers(sock, Some(body.len() as u64))?;
     sock.write_all(body.as_bytes())?;
     Ok(())
+}
+
+fn inner_text(s: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let i = s.find(&open)? + open.len();
+    let j = s[i..].find(&close)?;
+    Some(s[i..i + j].to_string())
 }
 
 pub fn error_response(

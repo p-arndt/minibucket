@@ -216,7 +216,7 @@ pub fn complete_multipart(
             part_md5s.extend_from_slice(&bytes);
         }
     }
-    let (_etag, _size) = writer.finish(&content_type)?;
+    let (_etag, _size, _vid) = writer.finish(&content_type)?;
 
     // S3 multipart ETag: md5(concat(part_md5_bytes)) + "-" + count, hex.
     let final_digest = crate::md5::md5(&part_md5s);

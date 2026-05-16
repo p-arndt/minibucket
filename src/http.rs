@@ -261,7 +261,7 @@ impl Response {
             write!(w, "Date: {}\r\n", crate::util::http_date_now())?;
         }
         if !have_server {
-            write!(w, "Server: frust/0.1\r\n")?;
+            write!(w, "Server: minibucket/0.1\r\n")?;
         }
         write!(w, "\r\n")?;
         Ok(())
