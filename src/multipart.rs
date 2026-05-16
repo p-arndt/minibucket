@@ -85,9 +85,9 @@ pub fn create_multipart(
     write_xml(sock, 200, &body, rid)
 }
 
-pub fn upload_part(
+pub fn upload_part<R: std::io::BufRead>(
     srv: &Server,
-    req: &mut Request,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     _key: &str,
@@ -151,9 +151,9 @@ pub fn upload_part(
     Ok(())
 }
 
-pub fn complete_multipart(
+pub fn complete_multipart<R: std::io::BufRead>(
     srv: &Server,
-    req: &mut Request,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     key: &str,

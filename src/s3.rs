@@ -15,9 +15,9 @@ pub struct Server {
     pub domain: Option<String>, // for virtual-hosted-style addressing
 }
 
-pub fn dispatch(
+pub fn dispatch<R: std::io::BufRead>(
     srv: &Server,
-    mut req: Request,
+    mut req: Request<R>,
     sock: &mut std::net::TcpStream,
     chunk_ctx: Option<crate::sigv4::ChunkContext>,
 ) -> std::io::Result<()> {
@@ -108,7 +108,7 @@ pub fn dispatch(
 }
 
 // Returns (bucket, key) from either virtual-hosted style or path style.
-fn resolve_addressing(srv: &Server, req: &Request, path: &str) -> (String, String) {
+fn resolve_addressing<R: std::io::BufRead>(srv: &Server, req: &Request<R>, path: &str) -> (String, String) {
     let trimmed = path.trim_start_matches('/');
     if let (Some(domain), Some(host)) = (srv.domain.as_ref(), req.headers.get("host")) {
         let host = host.split(':').next().unwrap_or(host);
@@ -134,7 +134,7 @@ fn qget<'a>(q: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 // ---------- handlers ----------
 
-fn list_buckets(srv: &Server, sock: &mut std::net::TcpStream, rid: &str) -> std::io::Result<()> {
+pub fn build_list_buckets(srv: &Server, rid: &str) -> crate::http::BuiltResponse {
     let buckets = srv.storage.list_buckets().unwrap_or_default();
     let mut body = String::new();
     body.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
@@ -148,18 +148,30 @@ fn list_buckets(srv: &Server, sock: &mut std::net::TcpStream, rid: &str) -> std:
         ));
     }
     body.push_str("</Buckets></ListAllMyBucketsResult>");
-    write_xml(sock, 200, &body, rid)
+    crate::http::BuiltResponse::new(200)
+        .header("x-amz-request-id", rid)
+        .xml(body)
 }
 
-fn bucket_location(srv: &Server, sock: &mut std::net::TcpStream, bucket: &str, rid: &str) -> std::io::Result<()> {
+fn list_buckets(srv: &Server, sock: &mut std::net::TcpStream, rid: &str) -> std::io::Result<()> {
+    build_list_buckets(srv, rid).write_to(sock)
+}
+
+pub fn build_bucket_location(srv: &Server, bucket: &str, rid: &str) -> crate::http::BuiltResponse {
     if !srv.storage.bucket_exists(bucket) {
-        return error_response(sock, 404, "NoSuchBucket", "The specified bucket does not exist", rid, bucket);
+        return build_error(404, "NoSuchBucket", "The specified bucket does not exist", rid, bucket);
     }
     let body = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
         xml_escape(&srv.region)
     );
-    write_xml(sock, 200, &body, rid)
+    crate::http::BuiltResponse::new(200)
+        .header("x-amz-request-id", rid)
+        .xml(body)
+}
+
+fn bucket_location(srv: &Server, sock: &mut std::net::TcpStream, bucket: &str, rid: &str) -> std::io::Result<()> {
+    build_bucket_location(srv, bucket, rid).write_to(sock)
 }
 
 fn head_bucket(srv: &Server, sock: &mut std::net::TcpStream, bucket: &str, rid: &str) -> std::io::Result<()> {
@@ -296,9 +308,9 @@ fn list_objects(
     write_xml(sock, 200, &body, rid)
 }
 
-fn put_object(
+fn put_object<R: std::io::BufRead>(
     srv: &Server,
-    req: &mut Request,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     key: &str,
@@ -585,9 +597,9 @@ fn delete_object(
     }
 }
 
-fn delete_objects(
+fn delete_objects<R: std::io::BufRead>(
     srv: &Server,
-    req: &mut Request,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     rid: &str,
@@ -672,7 +684,7 @@ fn delete_objects(
     write_xml(sock, 200, &body_out, rid)
 }
 
-pub fn read_body_all(req: &mut Request) -> std::io::Result<Vec<u8>> {
+pub fn read_body_all<R: std::io::BufRead>(req: &mut Request<R>) -> std::io::Result<Vec<u8>> {
     let is_chunked = req.headers.get("content-encoding").map(|v| v.contains("aws-chunked")).unwrap_or(false);
     let mut out = Vec::new();
     if is_chunked {
@@ -686,7 +698,7 @@ pub fn read_body_all(req: &mut Request) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn drain_body(req: &mut Request) -> std::io::Result<()> {
+fn drain_body<R: std::io::BufRead>(req: &mut Request<R>) -> std::io::Result<()> {
     let _ = read_body_all(req)?;
     Ok(())
 }
@@ -710,6 +722,25 @@ fn inner_text(s: &str, tag: &str) -> Option<String> {
     Some(s[i..i + j].to_string())
 }
 
+pub fn build_error(
+    status: u16,
+    code: &str,
+    message: &str,
+    rid: &str,
+    resource: &str,
+) -> crate::http::BuiltResponse {
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource><RequestId>{}</RequestId></Error>"#,
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(resource),
+        xml_escape(rid),
+    );
+    crate::http::BuiltResponse::new(status)
+        .header("x-amz-request-id", rid)
+        .xml(body)
+}
+
 pub fn error_response(
     sock: &mut std::net::TcpStream,
     status: u16,
@@ -718,14 +749,7 @@ pub fn error_response(
     rid: &str,
     resource: &str,
 ) -> std::io::Result<()> {
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource><RequestId>{}</RequestId></Error>"#,
-        xml_escape(code),
-        xml_escape(message),
-        xml_escape(resource),
-        xml_escape(rid),
-    );
-    write_xml(sock, status, &body, rid)
+    build_error(status, code, message, rid, resource).write_to(sock)
 }
 
 #[cfg(test)]

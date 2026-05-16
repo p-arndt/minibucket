@@ -18,15 +18,14 @@ fn tag_path(srv: &Server, bucket: &str, key: &str) -> PathBuf {
         .join(format!("{}.tags", key))
 }
 
-pub fn get_object_tagging(
+pub fn build_get_object_tagging(
     srv: &Server,
-    sock: &mut std::net::TcpStream,
     bucket: &str,
     key: &str,
     rid: &str,
-) -> std::io::Result<()> {
+) -> crate::http::BuiltResponse {
     if !srv.storage.bucket_exists(bucket) {
-        return error_response(sock, 404, "NoSuchBucket", "no such bucket", rid, bucket);
+        return crate::s3::build_error(404, "NoSuchBucket", "no such bucket", rid, bucket);
     }
     let p = tag_path(srv, bucket, key);
     let mut tags: Vec<(String, String)> = Vec::new();
@@ -49,12 +48,24 @@ pub fn get_object_tagging(
         ));
     }
     body.push_str("</TagSet></Tagging>");
-    write_xml(sock, 200, &body, rid)
+    crate::http::BuiltResponse::new(200)
+        .header("x-amz-request-id", rid)
+        .xml(body)
 }
 
-pub fn put_object_tagging(
+pub fn get_object_tagging(
     srv: &Server,
-    req: &mut Request,
+    sock: &mut std::net::TcpStream,
+    bucket: &str,
+    key: &str,
+    rid: &str,
+) -> std::io::Result<()> {
+    build_get_object_tagging(srv, bucket, key, rid).write_to(sock)
+}
+
+pub fn put_object_tagging<R: std::io::BufRead>(
+    srv: &Server,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     key: &str,

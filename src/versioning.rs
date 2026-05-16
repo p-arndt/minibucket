@@ -5,14 +5,13 @@ use crate::s3::{error_response, read_body_all, write_xml, Server};
 use crate::storage::{StorageError, VersioningStatus};
 use crate::util::{iso8601, xml_escape};
 
-pub fn get_versioning(
+pub fn build_get_versioning(
     srv: &Server,
-    sock: &mut std::net::TcpStream,
     bucket: &str,
     rid: &str,
-) -> std::io::Result<()> {
+) -> crate::http::BuiltResponse {
     if !srv.storage.bucket_exists(bucket) {
-        return error_response(sock, 404, "NoSuchBucket", "no such bucket", rid, bucket);
+        return crate::s3::build_error(404, "NoSuchBucket", "no such bucket", rid, bucket);
     }
     let status = srv.storage.versioning_status(bucket);
     let body = match status {
@@ -25,12 +24,23 @@ pub fn get_versioning(
             status.as_str()
         ),
     };
-    write_xml(sock, 200, &body, rid)
+    crate::http::BuiltResponse::new(200)
+        .header("x-amz-request-id", rid)
+        .xml(body)
 }
 
-pub fn put_versioning(
+pub fn get_versioning(
     srv: &Server,
-    req: &mut Request,
+    sock: &mut std::net::TcpStream,
+    bucket: &str,
+    rid: &str,
+) -> std::io::Result<()> {
+    build_get_versioning(srv, bucket, rid).write_to(sock)
+}
+
+pub fn put_versioning<R: std::io::BufRead>(
+    srv: &Server,
+    req: &mut Request<R>,
     sock: &mut std::net::TcpStream,
     bucket: &str,
     rid: &str,

@@ -7,13 +7,13 @@ use std::net::TcpStream;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
-pub struct Request {
+pub struct Request<R: BufRead = BufReader<TcpStream>> {
     pub method: String,
     pub raw_path: String,   // /bucket/key (still percent-encoded)
     pub path: String,       // percent-decoded path
     pub query_raw: String,  // a=1&b=2 (still encoded)
     pub headers: Headers,
-    pub reader: BufReader<TcpStream>,
+    pub reader: R,
 }
 
 #[derive(Default, Clone)]
@@ -36,7 +36,7 @@ impl Headers {
     }
 }
 
-pub fn read_request(stream: TcpStream) -> io::Result<Request> {
+pub fn read_request(stream: TcpStream) -> io::Result<Request<BufReader<TcpStream>>> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let n = read_line_limited(&mut reader, &mut line, MAX_LINE_BYTES)?;
@@ -114,16 +114,16 @@ fn read_line_limited<R: BufRead>(r: &mut R, out: &mut String, limit: usize) -> i
 // AWS streaming-aws-chunked decoder. Each chunk:
 //   <size-hex>;chunk-signature=<sig>\r\n<data>\r\n
 // Terminator: 0;chunk-signature=...\r\n\r\n
-pub struct AwsChunkedReader<'a> {
-    pub r: &'a mut BufReader<TcpStream>,
+pub struct AwsChunkedReader<'a, R: BufRead> {
+    pub r: &'a mut R,
     pub buf: Vec<u8>,
     pub pos: usize,
     pub done: bool,
     pub chunk_ctx: Option<crate::sigv4::ChunkContext>,
 }
 
-impl<'a> AwsChunkedReader<'a> {
-    pub fn new(r: &'a mut BufReader<TcpStream>) -> Self {
+impl<'a, R: BufRead> AwsChunkedReader<'a, R> {
+    pub fn new(r: &'a mut R) -> Self {
         Self { r, buf: Vec::new(), pos: 0, done: false, chunk_ctx: None }
     }
     pub fn with_chunk_ctx(mut self, ctx: Option<crate::sigv4::ChunkContext>) -> Self {
@@ -178,7 +178,7 @@ impl<'a> AwsChunkedReader<'a> {
     }
 }
 
-impl<'a> Read for AwsChunkedReader<'a> {
+impl<'a, R: BufRead> Read for AwsChunkedReader<'a, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.buf.len() {
             if self.done {
@@ -197,11 +197,11 @@ impl<'a> Read for AwsChunkedReader<'a> {
 }
 
 // Standard fixed-length body
-pub struct FixedReader<'a> {
-    pub r: &'a mut BufReader<TcpStream>,
+pub struct FixedReader<'a, R: BufRead> {
+    pub r: &'a mut R,
     pub remaining: u64,
 }
-impl<'a> Read for FixedReader<'a> {
+impl<'a, R: BufRead> Read for FixedReader<'a, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
             return Ok(0);
@@ -265,6 +265,91 @@ impl Response {
         }
         write!(w, "\r\n")?;
         Ok(())
+    }
+}
+
+// A response body. Bytes are buffered (small XML); Stream defers reading until
+// write_to so handlers can return a file/network reader without slurping it.
+pub enum Body {
+    Empty,
+    Bytes(Vec<u8>),
+    Stream(Box<dyn Read + Send>),
+}
+
+impl Body {
+    pub fn len_hint(&self) -> Option<u64> {
+        match self {
+            Body::Empty => Some(0),
+            Body::Bytes(v) => Some(v.len() as u64),
+            Body::Stream(_) => None,
+        }
+    }
+    pub fn into_bytes(self) -> io::Result<Vec<u8>> {
+        match self {
+            Body::Empty => Ok(Vec::new()),
+            Body::Bytes(v) => Ok(v),
+            Body::Stream(mut r) => {
+                let mut out = Vec::new();
+                r.read_to_end(&mut out)?;
+                Ok(out)
+            }
+        }
+    }
+}
+
+// A value-form HTTP response. Handlers build one of these and can either
+// hand it to write_to (production) or assert on its parts (tests).
+pub struct BuiltResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Body,
+}
+
+impl BuiltResponse {
+    pub fn new(status: u16) -> Self {
+        Self { status, headers: Vec::new(), body: Body::Empty }
+    }
+    pub fn header(mut self, k: &str, v: &str) -> Self {
+        self.headers.push((k.to_string(), v.to_string()));
+        self
+    }
+    pub fn body(mut self, body: Body) -> Self {
+        self.body = body;
+        self
+    }
+    pub fn xml(mut self, body: String) -> Self {
+        // Mark as XML if not already set.
+        let has_ct = self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+        if !has_ct {
+            self.headers.push(("Content-Type".into(), "application/xml".into()));
+        }
+        self.body = Body::Bytes(body.into_bytes());
+        self
+    }
+    pub fn write_to<W: Write>(self, w: &mut W) -> io::Result<()> {
+        let len_hint = self.body.len_hint();
+        let resp = Response { status: self.status, status_text: status_text(self.status), headers: self.headers };
+        resp.write_headers(w, len_hint)?;
+        match self.body {
+            Body::Empty => {}
+            Body::Bytes(v) => w.write_all(&v)?,
+            Body::Stream(mut r) => {
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = r.read(&mut buf)?;
+                    if n == 0 { break; }
+                    w.write_all(&buf[..n])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 
