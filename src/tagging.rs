@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::http::{Request, Response};
-use crate::s3::{error_response, read_body_all, write_xml, Server};
+use crate::s3::{error_response, read_body_all, Server};
 use crate::util::xml_escape;
 
 fn tag_path(srv: &Server, bucket: &str, key: &str) -> PathBuf {
@@ -158,5 +158,74 @@ mod tests {
             extract_inner("<Key>a</Key><Key>b</Key>", "Key"),
             Some("a".into())
         );
+    }
+
+    // ---- handler-level tests via BuiltResponse ----
+
+    use crate::storage::Storage;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("minibucket_thandler_{}_{}", label, nanos));
+        p
+    }
+
+    struct ScopedRoot(PathBuf);
+    impl Drop for ScopedRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn make_server(label: &str) -> (Server, ScopedRoot) {
+        let root = tmp_root(label);
+        let storage = Storage::new(root.clone()).unwrap();
+        (
+            Server {
+                storage,
+                credentials: crate::creds::Credentials::new(),
+                require_auth: false,
+                region: "us-east-1".into(),
+                domain: None,
+            },
+            ScopedRoot(root),
+        )
+    }
+
+    #[test]
+    fn build_get_object_tagging_404_for_missing_bucket() {
+        let (srv, _g) = make_server("tag_404");
+        let r = build_get_object_tagging(&srv, "missing", "k", "rid");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn build_get_object_tagging_empty_when_no_sidecar() {
+        let (srv, _g) = make_server("tag_empty");
+        srv.storage.create_bucket("buck").unwrap();
+        let r = build_get_object_tagging(&srv, "buck", "k", "rid");
+        assert_eq!(r.status, 200);
+        let body = String::from_utf8(r.body.into_bytes().unwrap()).unwrap();
+        assert!(body.contains("<TagSet></TagSet>"));
+    }
+
+    #[test]
+    fn build_get_object_tagging_reads_sidecar() {
+        let (srv, _g) = make_server("tag_present");
+        srv.storage.create_bucket("buck").unwrap();
+        // Write the sidecar directly — exercises only the read path.
+        let p = tag_path(&srv, "buck", "k");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut f = fs::File::create(&p).unwrap();
+        writeln!(f, "env=prod").unwrap();
+        writeln!(f, "team=storage").unwrap();
+        drop(f);
+        let r = build_get_object_tagging(&srv, "buck", "k", "rid");
+        assert_eq!(r.status, 200);
+        let body = String::from_utf8(r.body.into_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Key>env</Key><Value>prod</Value>"));
+        assert!(body.contains("<Key>team</Key><Value>storage</Value>"));
     }
 }

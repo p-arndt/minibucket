@@ -170,4 +170,72 @@ mod tests {
         assert!(VersioningStatus::Suspended.records_versions());
         assert!(!VersioningStatus::Disabled.records_versions());
     }
+
+    // ---- handler-level tests via BuiltResponse ----
+
+    use crate::storage::Storage;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("minibucket_vhandler_{}_{}", label, nanos));
+        p
+    }
+
+    struct ScopedRoot(PathBuf);
+    impl Drop for ScopedRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn make_server(label: &str) -> (Server, ScopedRoot) {
+        let root = tmp_root(label);
+        let storage = Storage::new(root.clone()).unwrap();
+        (
+            Server {
+                storage,
+                credentials: crate::creds::Credentials::new(),
+                require_auth: false,
+                region: "us-east-1".into(),
+                domain: None,
+            },
+            ScopedRoot(root),
+        )
+    }
+
+    #[test]
+    fn build_get_versioning_404() {
+        let (srv, _g) = make_server("ver_404");
+        let r = build_get_versioning(&srv, "missing", "rid");
+        assert_eq!(r.status, 404);
+        let body = String::from_utf8(r.body.into_bytes().unwrap()).unwrap();
+        assert!(body.contains("NoSuchBucket"));
+    }
+
+    #[test]
+    fn build_get_versioning_disabled_returns_empty_config() {
+        let (srv, _g) = make_server("ver_disabled");
+        srv.storage.create_bucket("buck").unwrap();
+        let r = build_get_versioning(&srv, "buck", "rid");
+        assert_eq!(r.status, 200);
+        let body = String::from_utf8(r.body.into_bytes().unwrap()).unwrap();
+        // Self-closing empty VersioningConfiguration.
+        assert!(body.contains("<VersioningConfiguration"));
+        assert!(body.contains("/>"));
+        assert!(!body.contains("<Status>"));
+    }
+
+    #[test]
+    fn build_get_versioning_enabled_includes_status() {
+        let (srv, _g) = make_server("ver_enabled");
+        srv.storage.create_bucket("buck").unwrap();
+        srv.storage
+            .set_versioning_status("buck", VersioningStatus::Enabled)
+            .unwrap();
+        let r = build_get_versioning(&srv, "buck", "rid");
+        assert_eq!(r.status, 200);
+        let body = String::from_utf8(r.body.into_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Status>Enabled</Status>"));
+    }
 }

@@ -783,4 +783,132 @@ mod tests {
         );
         assert_eq!(inner_text("<X>hello</X>", "Y"), None);
     }
+
+    // ---- handler-level tests ----
+
+    use crate::http::{BuiltResponse, Headers, Request};
+    use crate::storage::Storage;
+    use std::io::{BufReader, Cursor};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("minibucket_handler_{}_{}", label, nanos));
+        p
+    }
+
+    struct ScopedRoot(PathBuf);
+    impl Drop for ScopedRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn make_server(label: &str) -> (Server, ScopedRoot) {
+        let root = tmp_root(label);
+        let storage = Storage::new(root.clone()).unwrap();
+        let srv = Server {
+            storage,
+            credentials: crate::creds::Credentials::new(),
+            require_auth: false,
+            region: "us-east-1".into(),
+            domain: None,
+        };
+        (srv, ScopedRoot(root))
+    }
+
+    fn body_string(r: BuiltResponse) -> (u16, String) {
+        let status = r.status;
+        let bytes = r.body.into_bytes().unwrap();
+        (status, String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn build_list_buckets_empty() {
+        let (srv, _g) = make_server("list_empty");
+        let r = build_list_buckets(&srv, "rid-1");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header_value("x-amz-request-id"), Some("rid-1"));
+        assert_eq!(r.header_value("Content-Type"), Some("application/xml"));
+        let (_, body) = body_string(r);
+        assert!(body.contains("<ListAllMyBucketsResult"));
+        assert!(body.contains("<Buckets></Buckets>"));
+    }
+
+    #[test]
+    fn build_list_buckets_with_entries_sorted() {
+        let (srv, _g) = make_server("list_with");
+        srv.storage.create_bucket("zebra").unwrap();
+        srv.storage.create_bucket("alpha").unwrap();
+        let (_, body) = body_string(build_list_buckets(&srv, "rid"));
+        let a = body.find("<Name>alpha</Name>").expect("alpha listed");
+        let z = body.find("<Name>zebra</Name>").expect("zebra listed");
+        assert!(a < z, "alpha must precede zebra in body: {}", body);
+    }
+
+    #[test]
+    fn build_bucket_location_404_then_200() {
+        let (srv, _g) = make_server("loc");
+        let r = build_bucket_location(&srv, "missing", "rid");
+        assert_eq!(r.status, 404);
+        let (_, body) = body_string(r);
+        assert!(body.contains("<Code>NoSuchBucket</Code>"));
+
+        srv.storage.create_bucket("buck").unwrap();
+        let r = build_bucket_location(&srv, "buck", "rid");
+        assert_eq!(r.status, 200);
+        let (_, body) = body_string(r);
+        assert!(body.contains("<LocationConstraint"));
+        assert!(body.contains(">us-east-1<"));
+    }
+
+    #[test]
+    fn build_error_shape() {
+        let r = build_error(403, "AccessDenied", "nope <bad>", "rid-9", "/b/k");
+        assert_eq!(r.status, 403);
+        let (_, body) = body_string(r);
+        assert!(body.contains("<Code>AccessDenied</Code>"));
+        // xml_escape must encode '<' and '>' inside the message.
+        assert!(body.contains("<Message>nope &lt;bad&gt;</Message>"));
+        assert!(body.contains("<Resource>/b/k</Resource>"));
+        assert!(body.contains("<RequestId>rid-9</RequestId>"));
+    }
+
+    // Demonstrate the Request<R> generic: feed read_body_all a Cursor body and
+    // assert it reads it the way it would from a TcpStream.
+    #[test]
+    fn read_body_all_via_cursor() {
+        let payload = b"<Delete><Object><Key>k</Key></Object></Delete>";
+        let mut headers = Headers::default();
+        headers.insert("Content-Length", &payload.len().to_string());
+        let mut req: Request<BufReader<Cursor<Vec<u8>>>> = Request {
+            method: "POST".into(),
+            raw_path: "/b".into(),
+            path: "/b".into(),
+            query_raw: "delete".into(),
+            headers,
+            reader: BufReader::new(Cursor::new(payload.to_vec())),
+        };
+        let got = read_body_all(&mut req).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn read_body_all_aws_chunked() {
+        // One 5-byte chunk "hello" then a 0-byte terminator. Unsigned (no chunk
+        // signature verification): chunk-signature still required by the parser.
+        let body = b"5;chunk-signature=ignored\r\nhello\r\n0;chunk-signature=ignored\r\n\r\n";
+        let mut headers = Headers::default();
+        headers.insert("Content-Encoding", "aws-chunked");
+        let mut req: Request<BufReader<Cursor<Vec<u8>>>> = Request {
+            method: "PUT".into(),
+            raw_path: "/b/k".into(),
+            path: "/b/k".into(),
+            query_raw: "".into(),
+            headers,
+            reader: BufReader::new(Cursor::new(body.to_vec())),
+        };
+        let got = read_body_all(&mut req).unwrap();
+        assert_eq!(got, b"hello");
+    }
 }

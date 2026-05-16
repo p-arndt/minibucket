@@ -270,6 +270,7 @@ impl Response {
 
 // A response body. Bytes are buffered (small XML); Stream defers reading until
 // write_to so handlers can return a file/network reader without slurping it.
+#[allow(dead_code)] // Stream is for future GET/object streaming
 pub enum Body {
     Empty,
     Bytes(Vec<u8>),
@@ -313,6 +314,7 @@ impl BuiltResponse {
         self.headers.push((k.to_string(), v.to_string()));
         self
     }
+    #[allow(dead_code)] // public API for handlers that want to use Stream/Empty bodies directly
     pub fn body(mut self, body: Body) -> Self {
         self.body = body;
         self
