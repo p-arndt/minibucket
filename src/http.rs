@@ -291,3 +291,28 @@ pub fn status_text(code: u16) -> &'static str {
         _ => "OK",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headers_lookup_is_case_insensitive() {
+        let mut h = Headers::default();
+        h.insert("Content-Type", "text/plain");
+        assert_eq!(h.get("content-type"), Some("text/plain"));
+        assert_eq!(h.get("CONTENT-TYPE"), Some("text/plain"));
+        assert_eq!(h.get("Content-Type"), Some("text/plain"));
+        assert_eq!(h.get("missing"), None);
+    }
+
+    #[test]
+    fn headers_insert_preserves_first_order_and_overwrites_value() {
+        let mut h = Headers::default();
+        h.insert("Host", "example");
+        h.insert("X-Amz-Date", "20240101T000000Z");
+        h.insert("host", "other"); // same key, different case: should overwrite
+        assert_eq!(h.get("host"), Some("other"));
+        assert_eq!(h.order, vec!["host", "x-amz-date"]);
+    }
+}

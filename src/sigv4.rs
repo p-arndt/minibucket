@@ -256,4 +256,171 @@ mod tests {
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
         );
     }
+
+    fn headers_from(pairs: &[(&str, &str)]) -> Headers {
+        let mut h = Headers::default();
+        for (k, v) in pairs {
+            h.insert(k, v);
+        }
+        h
+    }
+
+    #[test]
+    fn parse_authorization_basic() {
+        let h = headers_from(&[
+            (
+                "Authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIA/20240101/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=deadbeef",
+            ),
+            ("x-amz-date", "20240101T000000Z"),
+            ("x-amz-content-sha256", "abc123"),
+        ]);
+        let info = parse_authorization(&h).unwrap();
+        assert_eq!(info.access_key, "AKIA");
+        assert_eq!(info.date, "20240101");
+        assert_eq!(info.region, "us-east-1");
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.signed_headers, vec!["host", "x-amz-date"]);
+        assert_eq!(info.signature, "deadbeef");
+        assert_eq!(info.amz_date, "20240101T000000Z");
+        assert_eq!(info.payload_hash, "abc123");
+    }
+
+    #[test]
+    fn parse_authorization_missing_header() {
+        let h = Headers::default();
+        assert!(matches!(parse_authorization(&h), Err(AuthError::Missing)));
+    }
+
+    #[test]
+    fn parse_authorization_malformed() {
+        let h = headers_from(&[("Authorization", "AWS2-FOO Credential=x")]);
+        assert!(matches!(parse_authorization(&h), Err(AuthError::Malformed)));
+
+        // Right algorithm, missing pieces.
+        let h = headers_from(&[("Authorization", "AWS4-HMAC-SHA256 Credential=a/b/c/d/aws4_request")]);
+        assert!(matches!(parse_authorization(&h), Err(AuthError::Malformed)));
+    }
+
+    #[test]
+    fn parse_authorization_default_payload_hash() {
+        let h = headers_from(&[(
+            "Authorization",
+            "AWS4-HMAC-SHA256 Credential=K/20240101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, Signature=abc",
+        )]);
+        let info = parse_authorization(&h).unwrap();
+        assert_eq!(info.payload_hash, "UNSIGNED-PAYLOAD");
+    }
+
+    #[test]
+    fn canonical_request_orders_query_and_lowercases_headers() {
+        let h = headers_from(&[
+            ("Host", "example.com"),
+            ("X-Amz-Date", "20240101T000000Z"),
+        ]);
+        let canon = canonical_request(
+            "GET",
+            "/bucket/key",
+            "b=2&a=1",
+            &h,
+            &["host".to_string(), "x-amz-date".to_string()],
+            "UNSIGNED-PAYLOAD",
+        );
+        let expected = "GET\n/bucket/key\na=1&b=2\nhost:example.com\nx-amz-date:20240101T000000Z\n\nhost;x-amz-date\nUNSIGNED-PAYLOAD";
+        assert_eq!(canon, expected);
+    }
+
+    #[test]
+    fn canonical_request_collapses_header_whitespace() {
+        let h = headers_from(&[("Host", "  ex  ample  ")]);
+        let canon = canonical_request(
+            "GET",
+            "/",
+            "",
+            &h,
+            &["host".to_string()],
+            "UNSIGNED-PAYLOAD",
+        );
+        assert!(canon.contains("host:ex ample\n"));
+    }
+
+    // End-to-end SigV4 verify: build a signed request, then verify accepts the
+    // correct signature and rejects a tampered one.
+    #[test]
+    fn verify_roundtrip_accepts_and_rejects() {
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let date = "20240101";
+        let region = "us-east-1";
+        let service = "s3";
+        let amz_date = "20240101T000000Z";
+        let payload_hash = "UNSIGNED-PAYLOAD";
+        let signed_headers = vec!["host".to_string(), "x-amz-date".to_string()];
+
+        let h = headers_from(&[
+            ("Host", "example.com"),
+            ("X-Amz-Date", amz_date),
+            ("x-amz-content-sha256", payload_hash),
+        ]);
+
+        let canon = canonical_request("GET", "/b/k", "", &h, &signed_headers, payload_hash);
+        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+        let sts = string_to_sign(amz_date, &scope, &canon);
+        let key = signing_key(secret, date, region, service);
+        let sig = hex(&hmac_sha256(&key, sts.as_bytes()));
+
+        let info = AuthInfo {
+            access_key: "AKIA".into(),
+            date: date.into(),
+            region: region.into(),
+            service: service.into(),
+            signed_headers: signed_headers.clone(),
+            signature: sig.clone(),
+            amz_date: amz_date.into(),
+            payload_hash: payload_hash.into(),
+        };
+        assert!(verify("GET", "/b/k", "", &h, secret, &info).is_ok());
+
+        // Tampered signature: must be rejected.
+        let bad = AuthInfo {
+            signature: "0".repeat(sig.len()),
+            ..info
+        };
+        assert!(matches!(
+            verify("GET", "/b/k", "", &h, secret, &bad),
+            Err(AuthError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn constant_time_eq_lengths_and_content() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn chunk_context_signs_and_advances() {
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let info = AuthInfo {
+            access_key: "AKIA".into(),
+            date: "20240101".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            signed_headers: vec!["host".into()],
+            signature: "seed".into(),
+            amz_date: "20240101T000000Z".into(),
+            payload_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".into(),
+        };
+        let mut ctx = ChunkContext::new(secret, &info);
+        assert_eq!(ctx.prev_signature, "seed");
+        let exp = ctx.expected_signature(b"hello");
+        assert!(ctx.verify_and_advance(b"hello", &exp).is_ok());
+        // prev_signature must advance to the just-verified chunk signature.
+        assert_eq!(ctx.prev_signature, exp);
+        // A mismatched signature must fail.
+        assert!(ctx.verify_and_advance(b"world", "00").is_err());
+    }
 }

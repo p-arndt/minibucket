@@ -70,6 +70,74 @@ pub fn encode_component(s: &str) -> String {
 }
 
 // Parse a query string into key/value pairs, keys/values percent-decoded.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode_str("hello%20world"), "hello world");
+        assert_eq!(percent_decode_str("a+b"), "a b");
+        assert_eq!(percent_decode_str("%2F%2f"), "//");
+    }
+
+    #[test]
+    fn percent_decode_keeps_invalid_escape() {
+        // '%' followed by non-hex must be preserved literally.
+        assert_eq!(percent_decode_str("a%zz"), "a%zz");
+        // Trailing '%' with no two following bytes.
+        assert_eq!(percent_decode_str("ab%"), "ab%");
+    }
+
+    #[test]
+    fn percent_decode_handles_non_utf8() {
+        // %FF is a lone byte; lossy decode replaces it with U+FFFD.
+        let s = percent_decode_str("%FF");
+        assert!(s.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn encode_path_preserves_slash_and_unreserved() {
+        assert_eq!(encode_path_sigv4("/a/b-c_d.e~f"), "/a/b-c_d.e~f");
+    }
+
+    #[test]
+    fn encode_path_escapes_other() {
+        assert_eq!(encode_path_sigv4("/a b"), "/a%20b");
+        assert_eq!(encode_path_sigv4("/aBc/!*'"), "/aBc/%21%2A%27");
+    }
+
+    #[test]
+    fn encode_component_escapes_slash() {
+        assert_eq!(encode_component("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn parse_query_simple() {
+        let q = parse_query("a=1&b=2");
+        assert_eq!(q, vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
+    }
+
+    #[test]
+    fn parse_query_empty_and_no_value() {
+        assert!(parse_query("").is_empty());
+        let q = parse_query("flag&k=v");
+        assert_eq!(q, vec![("flag".into(), "".into()), ("k".into(), "v".into())]);
+    }
+
+    #[test]
+    fn parse_query_decodes_percent() {
+        let q = parse_query("k%20ey=val%2Fue");
+        assert_eq!(q, vec![("k ey".into(), "val/ue".into())]);
+    }
+
+    #[test]
+    fn parse_query_skips_empty_pairs() {
+        let q = parse_query("a=1&&b=2");
+        assert_eq!(q, vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
+    }
+}
+
 pub fn parse_query(q: &str) -> Vec<(String, String)> {
     if q.is_empty() {
         return Vec::new();

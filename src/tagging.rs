@@ -120,3 +120,32 @@ fn extract_inner(s: &str, tag: &str) -> Option<String> {
     let j = s[i..].find(&close)?;
     Some(s[i..i + j].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_inner_basic() {
+        assert_eq!(extract_inner("<Key>k1</Key>", "Key"), Some("k1".into()));
+        assert_eq!(
+            extract_inner("<Tag><Key>k</Key><Value>v</Value></Tag>", "Value"),
+            Some("v".into())
+        );
+    }
+
+    #[test]
+    fn extract_inner_missing() {
+        assert_eq!(extract_inner("<Foo>x</Foo>", "Bar"), None);
+        assert_eq!(extract_inner("<Key>k</Key>", "Other"), None);
+    }
+
+    #[test]
+    fn extract_inner_first_occurrence() {
+        // First Key wins; second is ignored.
+        assert_eq!(
+            extract_inner("<Key>a</Key><Key>b</Key>", "Key"),
+            Some("a".into())
+        );
+    }
+}

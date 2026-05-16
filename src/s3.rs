@@ -727,3 +727,36 @@ pub fn error_response(
     );
     write_xml(sock, status, &body, rid)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_inclusive() {
+        assert_eq!(parse_range("bytes=0-99"), Some((0, Some(99))));
+        assert_eq!(parse_range("bytes=10-20"), Some((10, Some(20))));
+    }
+
+    #[test]
+    fn parse_range_open_ended() {
+        assert_eq!(parse_range("bytes=42-"), Some((42, None)));
+    }
+
+    #[test]
+    fn parse_range_rejects_malformed() {
+        assert_eq!(parse_range("0-99"), None);          // missing prefix
+        assert_eq!(parse_range("bytes=abc"), None);     // bad start
+        assert_eq!(parse_range("bytes=0"), None);       // missing dash
+        assert_eq!(parse_range("bytes=0-xyz"), None);   // bad end
+    }
+
+    #[test]
+    fn inner_text_finds_tag() {
+        assert_eq!(
+            inner_text("<X>hello</X>", "X").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(inner_text("<X>hello</X>", "Y"), None);
+    }
+}

@@ -136,3 +136,28 @@ fn extract_inner(s: &str, tag: &str) -> Option<String> {
     let j = s[i..].find(&close)?;
     Some(s[i..i + j].to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_status_from_versioning_xml() {
+        let xml = r#"<?xml version="1.0"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        assert_eq!(extract_inner(xml, "Status").as_deref(), Some("Enabled"));
+    }
+
+    #[test]
+    fn status_str_values() {
+        assert_eq!(VersioningStatus::Enabled.as_str(), "Enabled");
+        assert_eq!(VersioningStatus::Suspended.as_str(), "Suspended");
+        assert_eq!(VersioningStatus::Disabled.as_str(), "");
+    }
+
+    #[test]
+    fn records_versions_only_for_enabled_and_suspended() {
+        assert!(VersioningStatus::Enabled.records_versions());
+        assert!(VersioningStatus::Suspended.records_versions());
+        assert!(!VersioningStatus::Disabled.records_versions());
+    }
+}

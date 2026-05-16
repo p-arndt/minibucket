@@ -140,4 +140,49 @@ mod tests {
         let t = parse_amz_date("20130524T000000Z").unwrap();
         assert_eq!(sigv4_date(t), "20130524");
     }
+
+    #[test]
+    fn http_date_non_zero() {
+        // 2024-01-02 03:04:05 UTC = 1704164645
+        assert_eq!(http_date(1704164645), "Tue, 02 Jan 2024 03:04:05 GMT");
+    }
+
+    #[test]
+    fn iso_non_zero() {
+        assert_eq!(iso8601(1704164645), "2024-01-02T03:04:05.000Z");
+    }
+
+    #[test]
+    fn http_date_leap_year() {
+        // 2020-02-29 00:00:00 UTC = 1582934400
+        assert_eq!(http_date(1582934400), "Sat, 29 Feb 2020 00:00:00 GMT");
+    }
+
+    #[test]
+    fn parse_amz_rejects_malformed() {
+        assert!(parse_amz_date("").is_none());
+        assert!(parse_amz_date("20130524000000Z").is_none()); // missing T
+        assert!(parse_amz_date("20130524T000000").is_none()); // missing Z
+        assert!(parse_amz_date("XXXX0524T000000Z").is_none()); // bad year
+    }
+
+    #[test]
+    fn xml_escape_all_specials() {
+        assert_eq!(
+            xml_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&apos;f"
+        );
+    }
+
+    #[test]
+    fn xml_escape_passthrough() {
+        assert_eq!(xml_escape("hello world"), "hello world");
+    }
+
+    #[test]
+    fn request_id_is_hex_16() {
+        let r = request_id();
+        assert_eq!(r.len(), 16);
+        assert!(r.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_uppercase())));
+    }
 }
