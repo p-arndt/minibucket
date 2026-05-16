@@ -22,15 +22,14 @@ pub struct AuthInfo {
 #[derive(Debug)]
 pub enum AuthError {
     Missing,
-    Malformed(&'static str),
-    UnknownKey,
+    Malformed,
     BadSignature,
 }
 
 pub fn parse_authorization(headers: &Headers) -> Result<AuthInfo, AuthError> {
     let auth = headers.get("authorization").ok_or(AuthError::Missing)?;
     if !auth.starts_with("AWS4-HMAC-SHA256") {
-        return Err(AuthError::Malformed("not AWS4-HMAC-SHA256"));
+        return Err(AuthError::Malformed);
     }
     let rest = auth["AWS4-HMAC-SHA256".len()..].trim_start();
     let mut credential = "";
@@ -47,11 +46,11 @@ pub fn parse_authorization(headers: &Headers) -> Result<AuthInfo, AuthError> {
         }
     }
     if credential.is_empty() || signed_headers.is_empty() || signature.is_empty() {
-        return Err(AuthError::Malformed("missing field"));
+        return Err(AuthError::Malformed);
     }
     let cparts: Vec<&str> = credential.split('/').collect();
     if cparts.len() != 5 || cparts[4] != "aws4_request" {
-        return Err(AuthError::Malformed("bad credential scope"));
+        return Err(AuthError::Malformed);
     }
     let amz_date = headers.get("x-amz-date").unwrap_or("").to_string();
     let payload_hash = headers

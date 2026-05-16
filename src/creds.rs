@@ -23,10 +23,6 @@ impl Credentials {
 
     pub fn is_empty(&self) -> bool { self.map.is_empty() }
 
-    pub fn first_access(&self) -> Option<&str> {
-        self.map.keys().next().map(|s| s.as_str())
-    }
-
     // File format: lines of `ACCESS_KEY=SECRET_KEY`. `#` starts a comment.
     pub fn load_file(path: &Path) -> io::Result<Self> {
         let mut c = Self::new();

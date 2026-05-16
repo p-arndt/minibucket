@@ -58,7 +58,7 @@ impl VersioningStatus {
 
 #[derive(Debug)]
 pub enum StorageError {
-    Io(io::Error),
+    Io,
     InvalidName,
     NotFound,
     Exists,
@@ -66,7 +66,7 @@ pub enum StorageError {
 }
 
 impl From<io::Error> for StorageError {
-    fn from(e: io::Error) -> Self { StorageError::Io(e) }
+    fn from(_: io::Error) -> Self { StorageError::Io }
 }
 
 pub fn valid_bucket(name: &str) -> bool {

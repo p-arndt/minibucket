@@ -63,6 +63,7 @@ pub fn iso8601(secs: u64) -> String {
 }
 
 // SigV4 short date: "YYYYMMDD"
+#[cfg(test)]
 pub fn sigv4_date(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let (y, mo, d, _) = civil_from_days(days);
@@ -70,6 +71,7 @@ pub fn sigv4_date(secs: u64) -> String {
 }
 
 // Parse SigV4 amz-date "YYYYMMDDTHHMMSSZ" -> secs since epoch.
+#[cfg(test)]
 pub fn parse_amz_date(s: &str) -> Option<u64> {
     if s.len() != 16 || s.as_bytes()[8] != b'T' || s.as_bytes()[15] != b'Z' {
         return None;
@@ -85,6 +87,7 @@ pub fn parse_amz_date(s: &str) -> Option<u64> {
     if total < 0 { None } else { Some(total as u64) }
 }
 
+#[cfg(test)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
