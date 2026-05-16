@@ -180,6 +180,53 @@ pub fn verify(
     }
 }
 
+// Per-chunk signing context for STREAMING-AWS4-HMAC-SHA256-PAYLOAD.
+// Each chunk: string_to_sign = "AWS4-HMAC-SHA256-PAYLOAD\n<amzdate>\n<scope>\n<prev-sig>\n<sha256-of-empty>\n<sha256-of-chunk>"
+//             chunk_signature = hex(HMAC(signing_key, string_to_sign))
+// The seed signature is from the Authorization header; each verified chunk's
+// computed signature becomes prev-sig for the next.
+pub struct ChunkContext {
+    pub signing_key: [u8; 32],
+    pub amz_date: String,
+    pub scope: String,
+    pub prev_signature: String,
+    pub empty_hash: String,
+}
+
+impl ChunkContext {
+    pub fn new(secret: &str, info: &AuthInfo) -> Self {
+        let key = signing_key(secret, &info.date, &info.region, &info.service);
+        let scope = format!("{}/{}/{}/aws4_request", info.date, info.region, info.service);
+        Self {
+            signing_key: key,
+            amz_date: info.amz_date.clone(),
+            scope,
+            prev_signature: info.signature.clone(),
+            empty_hash: hex(&sha256(b"")),
+        }
+    }
+
+    pub fn expected_signature(&self, chunk_data: &[u8]) -> String {
+        let chunk_hash = hex(&sha256(chunk_data));
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            self.amz_date, self.scope, self.prev_signature, self.empty_hash, chunk_hash
+        );
+        hex(&hmac_sha256(&self.signing_key, sts.as_bytes()))
+    }
+
+    pub fn verify_and_advance(&mut self, chunk_data: &[u8], got: &str) -> Result<(), AuthError> {
+        let expected = self.expected_signature(chunk_data);
+        if constant_time_eq(expected.as_bytes(), got.as_bytes()) {
+            self.prev_signature = expected;
+            Ok(())
+        } else {
+            eprintln!("[sigv4-chunk] mismatch\n  expected: {}\n  got:      {}", expected, got);
+            Err(AuthError::BadSignature)
+        }
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

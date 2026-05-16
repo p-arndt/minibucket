@@ -119,11 +119,16 @@ pub struct AwsChunkedReader<'a> {
     pub buf: Vec<u8>,
     pub pos: usize,
     pub done: bool,
+    pub chunk_ctx: Option<crate::sigv4::ChunkContext>,
 }
 
 impl<'a> AwsChunkedReader<'a> {
     pub fn new(r: &'a mut BufReader<TcpStream>) -> Self {
-        Self { r, buf: Vec::new(), pos: 0, done: false }
+        Self { r, buf: Vec::new(), pos: 0, done: false, chunk_ctx: None }
+    }
+    pub fn with_chunk_ctx(mut self, ctx: Option<crate::sigv4::ChunkContext>) -> Self {
+        self.chunk_ctx = ctx;
+        self
     }
     fn fill_next_chunk(&mut self) -> io::Result<()> {
         if self.done {
@@ -132,21 +137,41 @@ impl<'a> AwsChunkedReader<'a> {
         let mut header = String::new();
         read_line_limited(self.r, &mut header, MAX_LINE_BYTES)?;
         let header = header.trim_end_matches(['\r', '\n']);
-        let size_hex = header.split(';').next().unwrap_or("").trim();
+        let mut size_hex = "";
+        let mut chunk_sig: Option<&str> = None;
+        for (i, part) in header.split(';').enumerate() {
+            if i == 0 {
+                size_hex = part.trim();
+            } else if let Some(v) = part.trim().strip_prefix("chunk-signature=") {
+                chunk_sig = Some(v);
+            }
+        }
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+        let mut data = vec![0u8; size];
+        if size > 0 {
+            self.r.read_exact(&mut data)?;
+        }
+        // Each chunk (including the 0-byte terminator) is followed by CRLF.
+        let mut crlf = [0u8; 2];
+        self.r.read_exact(&mut crlf)?;
+
+        if let Some(ctx) = self.chunk_ctx.as_mut() {
+            let sig = chunk_sig.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "chunk-signature missing")
+            })?;
+            if ctx.verify_and_advance(&data, sig).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk signature mismatch",
+                ));
+            }
+        }
+
         if size == 0 {
-            // Trailing CRLF (and possibly trailers)
-            let mut trail = String::new();
-            read_line_limited(self.r, &mut trail, MAX_LINE_BYTES)?;
             self.done = true;
             return Ok(());
         }
-        let mut data = vec![0u8; size];
-        self.r.read_exact(&mut data)?;
-        // Consume trailing \r\n
-        let mut crlf = [0u8; 2];
-        self.r.read_exact(&mut crlf)?;
         self.buf = data;
         self.pos = 0;
         Ok(())

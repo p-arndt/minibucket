@@ -9,43 +9,105 @@ use crate::util::{iso8601, request_id, xml_escape};
 
 pub struct Server {
     pub storage: Storage,
-    pub access_key: String,
-    pub secret_key: String,
+    pub credentials: crate::creds::Credentials,
     pub require_auth: bool,
     pub region: String,
+    pub domain: Option<String>, // for virtual-hosted-style addressing
 }
 
-pub fn dispatch(srv: &Server, mut req: Request, sock: &mut std::net::TcpStream) -> std::io::Result<()> {
+pub fn dispatch(
+    srv: &Server,
+    mut req: Request,
+    sock: &mut std::net::TcpStream,
+    chunk_ctx: Option<crate::sigv4::ChunkContext>,
+) -> std::io::Result<()> {
     let method = req.method.clone();
     let path = req.path.clone();
     let query = parse_query(&req.query_raw);
 
-    // /bucket or /bucket/key
-    let trimmed = path.trim_start_matches('/');
-    let (bucket, key) = match trimmed.find('/') {
-        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
-        None => (trimmed, ""),
-    };
+    // Resolve bucket + key. Prefer virtual-hosted style if the Host header
+    // matches the configured domain (e.g. bucket.s3.local).
+    let (bucket, key) = resolve_addressing(srv, &req, &path);
 
     let rid = request_id();
 
+    // Multipart upload routes (detected before the generic ones).
+    if has_q(&query, "uploads") {
+        return match method.as_str() {
+            "POST" if !key.is_empty() => {
+                crate::multipart::create_multipart(srv, sock, &bucket, &key, &req.headers, &rid)
+            }
+            "GET" if key.is_empty() => {
+                crate::multipart::list_multipart_uploads(srv, sock, &bucket, &rid)
+            }
+            _ => error_response(sock, 400, "InvalidRequest", "uploads route", &rid, &req.path),
+        };
+    }
+    if let Some(upload_id) = qget(&query, "uploadId") {
+        let upload_id = upload_id.to_string();
+        let part_number = qget(&query, "partNumber").and_then(|s| s.parse::<u32>().ok());
+        return match method.as_str() {
+            "PUT" if part_number.is_some() => crate::multipart::upload_part(
+                srv, &mut req, sock, &bucket, &key, &upload_id, part_number.unwrap(),
+                &rid, chunk_ctx,
+            ),
+            "POST" => crate::multipart::complete_multipart(
+                srv, &mut req, sock, &bucket, &key, &upload_id, &rid,
+            ),
+            "DELETE" => crate::multipart::abort_multipart(srv, sock, &bucket, &key, &upload_id, &rid),
+            "GET" => crate::multipart::list_parts(srv, sock, &bucket, &key, &upload_id, &rid),
+            _ => error_response(sock, 400, "InvalidRequest", "uploadId route", &rid, &req.path),
+        };
+    }
+
+    // Tagging routes.
+    if has_q(&query, "tagging") {
+        return match method.as_str() {
+            "GET" if !key.is_empty() => crate::tagging::get_object_tagging(srv, sock, &bucket, &key, &rid),
+            "PUT" if !key.is_empty() => crate::tagging::put_object_tagging(srv, &mut req, sock, &bucket, &key, &rid),
+            "DELETE" if !key.is_empty() => crate::tagging::delete_object_tagging(srv, sock, &bucket, &key, &rid),
+            _ => error_response(sock, 501, "NotImplemented", "bucket tagging not implemented", &rid, &req.path),
+        };
+    }
+
     let result: std::io::Result<()> = match method.as_str() {
         "GET" if bucket.is_empty() => list_buckets(srv, sock, &rid),
-        "GET" if key.is_empty() && has_q(&query, "location") => bucket_location(srv, sock, bucket, &rid),
-        "HEAD" if key.is_empty() => head_bucket(srv, sock, bucket, &rid),
-        "PUT" if key.is_empty() => create_bucket(srv, sock, bucket, &rid),
-        "DELETE" if key.is_empty() => delete_bucket(srv, sock, bucket, &rid),
-        "GET" if key.is_empty() => list_objects(srv, sock, bucket, &query, &rid),
+        "GET" if key.is_empty() && has_q(&query, "location") => bucket_location(srv, sock, &bucket, &rid),
+        "HEAD" if key.is_empty() => head_bucket(srv, sock, &bucket, &rid),
+        "PUT" if key.is_empty() => create_bucket(srv, sock, &bucket, &rid),
+        "DELETE" if key.is_empty() => delete_bucket(srv, sock, &bucket, &rid),
+        "GET" if key.is_empty() => list_objects(srv, sock, &bucket, &query, &rid),
         "POST" if key.is_empty() && has_q(&query, "delete") => {
-            delete_objects(srv, &mut req, sock, bucket, &rid)
+            delete_objects(srv, &mut req, sock, &bucket, &rid)
         }
-        "PUT" => put_object(srv, &mut req, sock, bucket, key, &rid),
-        "GET" => get_object(srv, sock, bucket, key, &req.headers, &rid, false),
-        "HEAD" => get_object(srv, sock, bucket, key, &req.headers, &rid, true),
-        "DELETE" => delete_object(srv, sock, bucket, key, &rid),
+        "PUT" if req.headers.get("x-amz-copy-source").is_some() => {
+            copy_object(srv, sock, &bucket, &key, &req.headers, &rid)
+        }
+        "PUT" => put_object(srv, &mut req, sock, &bucket, &key, &rid, chunk_ctx),
+        "GET" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, false),
+        "HEAD" => get_object(srv, sock, &bucket, &key, &req.headers, &rid, true),
+        "DELETE" => delete_object(srv, sock, &bucket, &key, &rid),
         _ => error_response(sock, 501, "NotImplemented", "Method not supported", &rid, &req.path),
     };
     result
+}
+
+// Returns (bucket, key) from either virtual-hosted style or path style.
+fn resolve_addressing(srv: &Server, req: &Request, path: &str) -> (String, String) {
+    let trimmed = path.trim_start_matches('/');
+    if let (Some(domain), Some(host)) = (srv.domain.as_ref(), req.headers.get("host")) {
+        let host = host.split(':').next().unwrap_or(host);
+        let suffix = format!(".{}", domain);
+        if let Some(bucket) = host.strip_suffix(&suffix) {
+            if !bucket.is_empty() {
+                return (bucket.to_string(), trimmed.to_string());
+            }
+        }
+    }
+    match trimmed.find('/') {
+        Some(i) => (trimmed[..i].to_string(), trimmed[i + 1..].to_string()),
+        None => (trimmed.to_string(), String::new()),
+    }
 }
 
 fn has_q(q: &[(String, String)], name: &str) -> bool {
@@ -226,6 +288,7 @@ fn put_object(
     bucket: &str,
     key: &str,
     rid: &str,
+    chunk_ctx: Option<crate::sigv4::ChunkContext>,
 ) -> std::io::Result<()> {
     if key.is_empty() {
         return error_response(sock, 400, "InvalidRequest", "Empty key", rid, key);
@@ -268,7 +331,7 @@ fn put_object(
 
     let mut buf = vec![0u8; 64 * 1024];
     if streaming {
-        let mut r = AwsChunkedReader::new(&mut req.reader);
+        let mut r = AwsChunkedReader::new(&mut req.reader).with_chunk_ctx(chunk_ctx);
         loop {
             let n = r.read(&mut buf)?;
             if n == 0 { break; }
@@ -310,6 +373,66 @@ fn put_object(
         .header("x-amz-request-id", rid);
     resp.write_headers(sock, Some(0))?;
     Ok(())
+}
+
+fn copy_object(
+    srv: &Server,
+    sock: &mut std::net::TcpStream,
+    dst_bucket: &str,
+    dst_key: &str,
+    headers: &Headers,
+    rid: &str,
+) -> std::io::Result<()> {
+    let source = match headers.get("x-amz-copy-source") {
+        Some(s) => s,
+        None => return error_response(sock, 400, "InvalidArgument", "missing x-amz-copy-source", rid, dst_key),
+    };
+    let decoded = crate::url::percent_decode_str(source.trim_start_matches('/'));
+    let (src_bucket, src_key) = match decoded.find('/') {
+        Some(i) => (decoded[..i].to_string(), decoded[i + 1..].to_string()),
+        None => return error_response(sock, 400, "InvalidArgument", "copy-source must be /bucket/key", rid, dst_key),
+    };
+
+    let (meta, mut src_file) = match srv.storage.get_object(&src_bucket, &src_key) {
+        Ok(v) => v,
+        Err(StorageError::NotFound) => {
+            return error_response(sock, 404, "NoSuchKey", "source not found", rid, &src_key);
+        }
+        Err(e) => return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, &src_key),
+    };
+
+    let mut writer = match srv.storage.put_object_writer(dst_bucket, dst_key) {
+        Ok(w) => w,
+        Err(StorageError::NotFound) => {
+            return error_response(sock, 404, "NoSuchBucket", "destination bucket missing", rid, dst_bucket);
+        }
+        Err(e) => return error_response(sock, 500, "InternalError", &format!("{:?}", e), rid, dst_key),
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src_file.read(&mut buf)?;
+        if n == 0 { break; }
+        if let Err(e) = writer.write(&buf[..n]) {
+            writer.abort();
+            return error_response(sock, 500, "InternalError", &format!("{}", e), rid, dst_key);
+        }
+    }
+    let (etag, _size) = match writer.finish(&meta.content_type) {
+        Ok(v) => v,
+        Err(e) => return error_response(sock, 500, "InternalError", &format!("{}", e), rid, dst_key),
+    };
+    let now = crate::util::iso8601(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag></CopyObjectResult>"#,
+        now, etag
+    );
+    write_xml(sock, 200, &body, rid)
 }
 
 fn get_object(
@@ -437,7 +560,7 @@ fn delete_objects(
     write_xml(sock, 200, &body_out, rid)
 }
 
-fn read_body_all(req: &mut Request) -> std::io::Result<Vec<u8>> {
+pub fn read_body_all(req: &mut Request) -> std::io::Result<Vec<u8>> {
     let is_chunked = req.headers.get("content-encoding").map(|v| v.contains("aws-chunked")).unwrap_or(false);
     let mut out = Vec::new();
     if is_chunked {
