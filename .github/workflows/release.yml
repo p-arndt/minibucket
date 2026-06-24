@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag to build and publish, e.g. v0.1.4 (the release/tag is created at the selected branch)"
-        required: true
+        description: "Optional version override, e.g. v0.1.4. Leave empty to use the version from Cargo.toml."
+        required: false
         type: string
 
 permissions:
@@ -16,12 +16,37 @@ permissions:
   packages: write
 
 jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            # Manual override from the workflow_dispatch input.
+            version="${{ inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: use the pushed tag.
+            version="${GITHUB_REF_NAME}"
+          else
+            # Manual run with no override: derive from Cargo.toml.
+            version="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          fi
+          echo "Resolved version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
-    # Tag push -> the pushed tag; manual run -> the `tag` input.
     env:
-      VERSION: ${{ inputs.tag || github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -105,7 +130,7 @@ jobs:
 
   docker:
     name: Build and push Docker image
-    needs: build
+    needs: [version, build]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -134,8 +159,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           # `value` makes semver tags work on manual dispatch (no git tag ref).
           tags: |
-            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
             type=raw,value=latest
 
       - name: Build and push image
@@ -144,7 +169,7 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          build-args: VERSION=${{ inputs.tag || github.ref_name }}
+          build-args: VERSION=${{ needs.version.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -152,7 +177,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [build, docker]
+    needs: [version, build, docker]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -169,7 +194,7 @@ jobs:
         with:
           # On manual dispatch this creates the tag at the selected ref;
           # on a tag push it reuses the pushed tag.
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.version.outputs.version }}
           files: |
             dist/*.tar.gz
             dist/*.zip
