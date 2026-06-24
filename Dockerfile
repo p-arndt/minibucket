@@ -34,7 +34,7 @@ RUN case "$TARGETARCH" in \
         arm64) RUST_TARGET=aarch64-unknown-linux-musl ;; \
         *)     echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && cargo build --release --locked --target "$RUST_TARGET" \
+    && cargo build --release --target "$RUST_TARGET" \
     && cp "target/$RUST_TARGET/release/minibucket" /minibucket
 
 # Pre-create the data directory so it lands in the runtime image owned by the
