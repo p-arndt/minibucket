@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build and publish, e.g. v0.1.4 (the release/tag is created at the selected branch)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,6 +19,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Tag push -> the pushed tag; manual run -> the `tag` input.
+    env:
+      VERSION: ${{ inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +76,7 @@ jobs:
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          name="minibucket-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          name="minibucket-${VERSION:-dev}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/minibucket" "dist/$name/"
           cp README.md "dist/$name/" 2>/dev/null || true
@@ -79,7 +87,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $name = "minibucket-$($env:GITHUB_REF_NAME ?? 'dev')-${{ matrix.target }}"
+          $name = "minibucket-$($env:VERSION ?? 'dev')-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/minibucket.exe" "dist/$name/"
           if (Test-Path README.md) { Copy-Item README.md "dist/$name/" }
@@ -98,7 +106,7 @@ jobs:
   docker:
     name: Build and push Docker image
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -124,9 +132,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `value` makes semver tags work on manual dispatch (no git tag ref).
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
             type=raw,value=latest
 
       - name: Build and push image
@@ -135,7 +144,7 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          build-args: VERSION=${{ github.ref_name }}
+          build-args: VERSION=${{ inputs.tag || github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -144,17 +153,23 @@ jobs:
   release:
     name: Publish release
     needs: [build, docker]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
         with:
+          # Only the binary artifacts; skip the `*.dockerbuild` build record
+          # that docker/build-push-action uploads automatically.
+          pattern: minibucket-*
           path: dist
           merge-multiple: true
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          # On manual dispatch this creates the tag at the selected ref;
+          # on a tag push it reuses the pushed tag.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist/*.tar.gz
             dist/*.zip
