@@ -53,6 +53,37 @@ cargo build --release
 
 The resulting `target/release/minibucket` is self-contained.
 
+### Docker
+
+Prebuilt images are published to GitHub Container Registry for `linux/amd64`
+and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/p-arndt/minibucket:latest
+```
+
+The image is built from `scratch` and contains nothing but the static binary,
+so it's only a few MB. It listens on `0.0.0.0:9000` and stores data in the
+`/data` volume by default:
+
+```bash
+docker run --rm -p 9000:9000 -v minibucket-data:/data ghcr.io/p-arndt/minibucket:latest
+```
+
+The default `CMD` is `--bind 0.0.0.0:9000 --root /data`. Override it to pass any
+of the options below — for example, anonymous mode:
+
+```bash
+docker run --rm -p 9000:9000 -v minibucket-data:/data \
+  ghcr.io/p-arndt/minibucket:latest --bind 0.0.0.0:9000 --root /data --anonymous
+```
+
+To build the image yourself:
+
+```bash
+docker build -t minibucket .
+```
+
 ## Usage
 
 ```

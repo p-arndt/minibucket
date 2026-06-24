@@ -1,0 +1,10 @@
+target/
+data/
+.git/
+.github/
+*.md
+creds.example
+smoketest.py
+version_test.py
+Dockerfile
+.dockerignore
