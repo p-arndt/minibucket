@@ -6,10 +6,20 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Optional version override, e.g. v0.1.4. Leave empty to use the version from Cargo.toml."
+      version:
+        description: 'Version to release, e.g. 0.2.0 or 0.2.0-rc.1 ("v" prefix optional). Leave empty to use the Cargo.toml version with a unique "-pre.<run>" suffix.'
         required: false
         type: string
+      prerelease:
+        description: "Mark as a GitHub pre-release (also skips the Docker 'latest' tag)."
+        required: false
+        type: boolean
+        default: true
+      draft:
+        description: "Create the GitHub release as a draft to review before publishing."
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -21,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      draft: ${{ steps.resolve.outputs.draft }}
     steps:
       - uses: actions/checkout@v5
 
@@ -28,18 +40,30 @@ jobs:
         id: resolve
         shell: bash
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            # Manual override from the workflow_dispatch input.
-            version="${{ inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            # Tag push: use the pushed tag.
-            version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            if [ -z "$version" ]; then
+              # No version given: derive from Cargo.toml and add a unique
+              # "-pre.<run>" suffix so re-runs never collide with an existing
+              # tag/release (this was the old pipeline's failure mode).
+              base="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+              version="${base}-pre.${{ github.run_number }}"
+            fi
+            # Normalise the "v" prefix.
+            case "$version" in v*) ;; *) version="v$version" ;; esac
+            prerelease="${{ inputs.prerelease }}"
+            draft="${{ inputs.draft }}"
           else
-            # Manual run with no override: derive from Cargo.toml.
-            version="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+            # Tag push: use the pushed tag verbatim.
+            version="${GITHUB_REF_NAME}"
+            draft=false
+            # A semver pre-release identifier (v1.2.3-rc.1) flags it automatically.
+            case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
           fi
-          echo "Resolved version: $version"
+          echo "Resolved version: $version (prerelease=$prerelease draft=$draft)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -131,11 +155,14 @@ jobs:
   docker:
     name: Build and push Docker image
     needs: [version, build]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    env:
+      # Don't upload the `*.dockerbuild` build-record artifact. It's useless to
+      # the release job and its flaky download was what failed the old pipeline.
+      DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
       - uses: actions/checkout@v5
 
@@ -158,10 +185,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           # `value` makes semver tags work on manual dispatch (no git tag ref).
+          # The `latest` tag is only applied to stable (non-pre-release) versions;
+          # metadata-action already skips {{major}}.{{minor}} for pre-releases.
           tags: |
             type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.version.outputs.prerelease == 'false' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -178,7 +207,6 @@ jobs:
   release:
     name: Publish release
     needs: [version, build, docker]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -195,6 +223,8 @@ jobs:
           # On manual dispatch this creates the tag at the selected ref;
           # on a tag push it reuses the pushed tag.
           tag_name: ${{ needs.version.outputs.version }}
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          draft: ${{ needs.version.outputs.draft == 'true' }}
           files: |
             dist/*.tar.gz
             dist/*.zip
