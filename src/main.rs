@@ -170,7 +170,12 @@ fn handle(srv: Arc<Server>, stream: TcpStream) -> std::io::Result<()> {
 
     let mut chunk_ctx: Option<crate::sigv4::ChunkContext> = None;
 
-    if srv.require_auth {
+    if srv.require_auth && crate::sigv4::is_presigned(&req.query_raw) {
+        // ---- Presigned URL (query-string) authentication ----
+        if let Err(resp) = authenticate_presigned(&srv, &req, &mut sock) {
+            return resp;
+        }
+    } else if srv.require_auth {
         match crate::sigv4::parse_authorization(&req.headers) {
             Ok(info) => {
                 let secret = match srv.credentials.secret_for(&info.access_key) {
@@ -239,5 +244,87 @@ fn handle(srv: Arc<Server>, stream: TcpStream) -> std::io::Result<()> {
         let _ = resp.write_headers(&mut sock, Some(0));
     }
     let _ = sock.flush();
+    Ok(())
+}
+
+// Verify a presigned (query-string) SigV4 request. On any failure this writes
+// the appropriate S3 error response and returns Err(<that write result>), which
+// handle() propagates. Ok(()) means the request is authenticated.
+fn authenticate_presigned(
+    srv: &Server,
+    req: &crate::http::Request,
+    sock: &mut TcpStream,
+) -> Result<(), std::io::Result<()>> {
+    let pre = match crate::sigv4::parse_presigned(&req.query_raw) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[auth] presign malformed: {:?}", e);
+            return Err(error_response(
+                sock,
+                400,
+                "AuthorizationQueryParametersError",
+                "Malformed presigned request",
+                &crate::util::request_id(),
+                &req.path,
+            ));
+        }
+    };
+    let secret = match srv.credentials.secret_for(&pre.info.access_key) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(error_response(
+                sock,
+                403,
+                "InvalidAccessKeyId",
+                "Unknown access key",
+                &crate::util::request_id(),
+                &req.path,
+            ));
+        }
+    };
+    // Expiry window: signed-at + X-Amz-Expires must lie in the future, and the
+    // window itself must be within S3's 1s..=7d bounds.
+    match crate::util::parse_amz_date(&pre.info.amz_date) {
+        Some(signed_at) if (1..=604_800).contains(&pre.expires) => {
+            if crate::util::now_secs() > signed_at + pre.expires {
+                return Err(error_response(
+                    sock,
+                    403,
+                    "AccessDenied",
+                    "Request has expired",
+                    &crate::util::request_id(),
+                    &req.path,
+                ));
+            }
+        }
+        _ => {
+            return Err(error_response(
+                sock,
+                400,
+                "AuthorizationQueryParametersError",
+                "Invalid X-Amz-Date or X-Amz-Expires",
+                &crate::util::request_id(),
+                &req.path,
+            ));
+        }
+    }
+    if let Err(e) = crate::sigv4::verify_presigned(
+        &req.method,
+        &req.raw_path,
+        &req.query_raw,
+        &req.headers,
+        &secret,
+        &pre.info,
+    ) {
+        eprintln!("[auth] presign verify failed: {:?}", e);
+        return Err(error_response(
+            sock,
+            403,
+            "SignatureDoesNotMatch",
+            "The signature does not match",
+            &crate::util::request_id(),
+            &req.path,
+        ));
+    }
     Ok(())
 }

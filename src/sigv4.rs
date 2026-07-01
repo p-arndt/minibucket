@@ -87,17 +87,31 @@ pub fn canonical_request(
     signed_headers: &[String],
     payload_hash: &str,
 ) -> String {
+    let parts = parse_query(query_raw);
+    canonical_request_pairs(method, raw_path, &parts, headers, signed_headers, payload_hash)
+}
+
+// Same as canonical_request but takes already-parsed (decoded) query pairs.
+// Presigned-URL verification uses this to drop the X-Amz-Signature parameter
+// from the canonical query before signing.
+pub fn canonical_request_pairs(
+    method: &str,
+    raw_path: &str,
+    query_pairs: &[(String, String)],
+    headers: &Headers,
+    signed_headers: &[String],
+    payload_hash: &str,
+) -> String {
     // Canonical URI: the path, percent-encoded per SigV4 (S3: single-encoded).
     // We re-encode from the decoded form to ensure canonical output regardless
     // of how the client presented it on the wire.
     let decoded_path = crate::url::percent_decode_str(raw_path);
     let canonical_uri = encode_path_sigv4(&decoded_path);
 
-    // Canonical query string: parse, encode each key/value, sort by encoded key.
-    let parts = parse_query(query_raw);
-    let mut encoded: Vec<(String, String)> = parts
-        .into_iter()
-        .map(|(k, v)| (encode_component(&k), encode_component(&v)))
+    // Canonical query string: encode each key/value, sort by encoded key.
+    let mut encoded: Vec<(String, String)> = query_pairs
+        .iter()
+        .map(|(k, v)| (encode_component(k), encode_component(v)))
         .collect();
     encoded.sort_by(|a, b| match a.0.cmp(&b.0) {
         std::cmp::Ordering::Equal => a.1.cmp(&b.1),
@@ -174,6 +188,115 @@ pub fn verify(
         Ok(())
     } else {
         eprintln!("[sigv4] mismatch\n--- canonical ---\n{}\n--- sts ---\n{}\n--- expected ---\n{}\n--- got ---\n{}",
+            canon, sts, sig, info.signature);
+        Err(AuthError::BadSignature)
+    }
+}
+
+// ---- Presigned URLs (query-string authentication) ----
+//
+// A presigned request carries all SigV4 parameters in the query string instead
+// of the Authorization header:
+//   X-Amz-Algorithm=AWS4-HMAC-SHA256
+//   X-Amz-Credential=<access>/<date>/<region>/<service>/aws4_request
+//   X-Amz-Date=<amz-date>
+//   X-Amz-Expires=<seconds>
+//   X-Amz-SignedHeaders=<h1;h2;...>
+//   X-Amz-Signature=<hex>
+// The payload is always UNSIGNED-PAYLOAD, and the string-to-sign is built from
+// a canonical query that excludes X-Amz-Signature itself.
+
+pub struct PresignedInfo {
+    pub info: AuthInfo,
+    // Validity window in seconds, from X-Amz-Expires.
+    pub expires: u64,
+}
+
+// True if the query string looks like a presigned SigV4 request.
+pub fn is_presigned(query_raw: &str) -> bool {
+    parse_query(query_raw)
+        .iter()
+        .any(|(k, _)| k == "X-Amz-Signature")
+}
+
+pub fn parse_presigned(query_raw: &str) -> Result<PresignedInfo, AuthError> {
+    let pairs = parse_query(query_raw);
+    let mut algorithm = "";
+    let mut credential = "";
+    let mut amz_date = "";
+    let mut expires = "";
+    let mut signed_headers = "";
+    let mut signature = "";
+    for (k, v) in &pairs {
+        match k.as_str() {
+            "X-Amz-Algorithm" => algorithm = v,
+            "X-Amz-Credential" => credential = v,
+            "X-Amz-Date" => amz_date = v,
+            "X-Amz-Expires" => expires = v,
+            "X-Amz-SignedHeaders" => signed_headers = v,
+            "X-Amz-Signature" => signature = v,
+            _ => {}
+        }
+    }
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err(AuthError::Malformed);
+    }
+    if credential.is_empty()
+        || amz_date.is_empty()
+        || signed_headers.is_empty()
+        || signature.is_empty()
+    {
+        return Err(AuthError::Malformed);
+    }
+    let expires: u64 = expires.parse().map_err(|_| AuthError::Malformed)?;
+    let cparts: Vec<&str> = credential.split('/').collect();
+    if cparts.len() != 5 || cparts[4] != "aws4_request" {
+        return Err(AuthError::Malformed);
+    }
+    Ok(PresignedInfo {
+        info: AuthInfo {
+            access_key: cparts[0].to_string(),
+            date: cparts[1].to_string(),
+            region: cparts[2].to_string(),
+            service: cparts[3].to_string(),
+            signed_headers: signed_headers.split(';').map(|s| s.to_string()).collect(),
+            signature: signature.to_string(),
+            amz_date: amz_date.to_string(),
+            payload_hash: "UNSIGNED-PAYLOAD".to_string(),
+        },
+        expires,
+    })
+}
+
+pub fn verify_presigned(
+    method: &str,
+    raw_path: &str,
+    query_raw: &str,
+    headers: &Headers,
+    secret: &str,
+    info: &AuthInfo,
+) -> Result<(), AuthError> {
+    // Canonical query excludes X-Amz-Signature; everything else is signed.
+    let pairs: Vec<(String, String)> = parse_query(query_raw)
+        .into_iter()
+        .filter(|(k, _)| k != "X-Amz-Signature")
+        .collect();
+    let canon = canonical_request_pairs(
+        method,
+        raw_path,
+        &pairs,
+        headers,
+        &info.signed_headers,
+        &info.payload_hash,
+    );
+    let scope = format!("{}/{}/{}/aws4_request", info.date, info.region, info.service);
+    let sts = string_to_sign(&info.amz_date, &scope, &canon);
+    let key = signing_key(secret, &info.date, &info.region, &info.service);
+    let sig = hex(&hmac_sha256(&key, sts.as_bytes()));
+    if constant_time_eq(sig.as_bytes(), info.signature.as_bytes()) {
+        Ok(())
+    } else {
+        eprintln!("[sigv4-presign] mismatch\n--- canonical ---\n{}\n--- sts ---\n{}\n--- expected ---\n{}\n--- got ---\n{}",
             canon, sts, sig, info.signature);
         Err(AuthError::BadSignature)
     }
@@ -389,6 +512,68 @@ mod tests {
         };
         assert!(matches!(
             verify("GET", "/b/k", "", &h, secret, &bad),
+            Err(AuthError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn is_presigned_detects_query_signature() {
+        assert!(is_presigned("X-Amz-Signature=abc&foo=bar"));
+        assert!(!is_presigned("foo=bar"));
+        assert!(!is_presigned(""));
+    }
+
+    #[test]
+    fn parse_presigned_malformed() {
+        // Wrong algorithm.
+        assert!(matches!(
+            parse_presigned("X-Amz-Algorithm=AWS2&X-Amz-Signature=x&X-Amz-Credential=a/b/c/d/aws4_request&X-Amz-Date=d&X-Amz-SignedHeaders=host"),
+            Err(AuthError::Malformed)
+        ));
+        // Non-numeric expires.
+        assert!(matches!(
+            parse_presigned("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=x&X-Amz-Credential=a/20240101/us-east-1/s3/aws4_request&X-Amz-Date=d&X-Amz-Expires=soon&X-Amz-SignedHeaders=host"),
+            Err(AuthError::Malformed)
+        ));
+    }
+
+    // End-to-end presigned verify: build a signed query, verify accepts the
+    // correct signature and rejects a tampered one.
+    #[test]
+    fn presigned_roundtrip_accepts_and_rejects() {
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let base = "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+            &X-Amz-Credential=AKIA/20240101/us-east-1/s3/aws4_request\
+            &X-Amz-Date=20240101T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host";
+        let h = headers_from(&[("Host", "example.com")]);
+
+        // Compute the expected signature exactly as verify_presigned does.
+        let pairs: Vec<(String, String)> = parse_query(base);
+        let canon = canonical_request_pairs(
+            "GET",
+            "/b/k",
+            &pairs,
+            &h,
+            &["host".to_string()],
+            "UNSIGNED-PAYLOAD",
+        );
+        let scope = "20240101/us-east-1/s3/aws4_request";
+        let sts = string_to_sign("20240101T000000Z", scope, &canon);
+        let key = signing_key(secret, "20240101", "us-east-1", "s3");
+        let sig = hex(&hmac_sha256(&key, sts.as_bytes()));
+
+        let good = format!("{}&X-Amz-Signature={}", base, sig);
+        let pre = parse_presigned(&good).unwrap();
+        assert_eq!(pre.expires, 3600);
+        assert_eq!(pre.info.access_key, "AKIA");
+        assert_eq!(pre.info.payload_hash, "UNSIGNED-PAYLOAD");
+        assert!(verify_presigned("GET", "/b/k", &good, &h, secret, &pre.info).is_ok());
+
+        // Tampered signature: must be rejected.
+        let bad = format!("{}&X-Amz-Signature={}", base, "0".repeat(sig.len()));
+        let badpre = parse_presigned(&bad).unwrap();
+        assert!(matches!(
+            verify_presigned("GET", "/b/k", &bad, &h, secret, &badpre.info),
             Err(AuthError::BadSignature)
         ));
     }
